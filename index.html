@@ -1093,7 +1093,7 @@ let _derivReconnectTimer = null;
 
 const CFG = {
   RISK_PCT     : 1.0,
-  RR           : 3.0,
+  RR           : 1.5,
   START_BALANCE: 0,
   PROFIT_TARGET: 0,
   MAX_DD_PCT   : 5.0,
@@ -1102,19 +1102,21 @@ const CFG = {
   MAX_LOT_CAP  : 10.0,
   // ── Risk Mode: REPORT = warn but allow, BLOCK = reject overflow trades ──
   RISK_MODE    : 'REPORT',   // 'REPORT' | 'BLOCK'
-  MAX_SL_PTS   : 15.0,        // Hard cap on SL distance (raised from 6.0 for XAUUSD)
+  MAX_SL_PTS   : 4.0,         // HFT: tight SL sized for moves achievable in ≤2min on XAUUSD
   // ── Three-Phase Trailing Stop ──
   TRAIL_ENABLED: true,
   TRAIL_PHASE_1: 60,          // % to TP for BE lock — raised from 50% to avoid premature BE on volatility
   TRAIL_PHASE_2: 80,          // % to TP for 40% trail
   TRAIL_PHASE_3: 93,          // % to TP for 60% runner trail
-  TRAIL_DIST   : 5.0,        // Min trail distance — raised from 3.0 for XAUUSD volatility
+  TRAIL_DIST   : 1.5,        // HFT: tightened to match smaller SL/TP scale
   // ── Blow-Proof Safety Layer Settings (user-configurable) ──
   SAFETY_HARD_FLOOR_PCT   : 10,   // % of start balance = hard floor
   SAFETY_MAX_RISK_CAP_PCT : 5,    // % hard cap on risk per trade
   SAFETY_CONSEC_LOSS_HALVE: 3,    // consecutive losses before halving risk
   SAFETY_EMERG_FLOOR_PCT  : 15,   // % above floor = emergency warning zone
   SAFETY_MIN_MARGIN_PCT   : 50,   // % of free margin that must remain
+  // ── HFT MODE: hard max hold time per trade (seconds) ──
+  MAX_HOLD_SEC : 120,             // force-close ANY position (win/loss/flat) after this long
 };
 
 const SAFETY = {
@@ -1154,6 +1156,8 @@ let liveMaxDD       = 0;    // running max drawdown % in current session
 
 let sigCount = 0, wins = 0, losses = 0;
 let lastSigMs = 0, currentTF = 60;
+let lastMomentumMs = 0;
+const MOMENTUM_COOLDOWN_MS = 30 * 1000; // HFT: allow a momentum-follow trade at most every 30s
 const tradeLog = [];
 const candles  = { 60:[], 300:[], 900:[] };
 
@@ -3417,18 +3421,17 @@ function checkDemoPositions() {
     updateStatsStrip();
   });
 
-  // ── SURVIVAL ENGINE: DEAD TRADE EXIT ──
-  // Closes stagnant positions that have been open 20+ M1 bars (≥20 min) with no PnL.
-  // Prevents capital being tied up in setups that have lost momentum.
+  // ── HFT MODE: HARD MAX-HOLD TIME EXIT ──
+  // Force-closes ANY position — winning, losing, or flat — once it has been
+  // open longer than CFG.MAX_HOLD_SEC (default 120s = 2min). This is the
+  // core HFT constraint: every trade must resolve within ~2 minutes,
+  // regardless of whether TP/SL has been hit yet.
   demoPositions.forEach(pos => {
     if(closeData.find(c => c.pos.id === pos.id)) return; // already queued
     const ageMs = Date.now() - (pos.openTime || Date.now());
-    const ageBars = Math.floor(ageMs / 60000); // 1 bar = 1 minute (M1)
-    if(ageBars < 20) return;
+    if(ageMs < CFG.MAX_HOLD_SEC * 1000) return;
     const pnl = calcPnLForPos(pos, mid);
-    if(pnl <= 0) {
-      closeData.push({ pos, pnl: pnl, reason: 'TIME_EXIT' });
-    }
+    closeData.push({ pos, pnl: pnl, reason: 'TIME_EXIT' });
   });
 
   // ── CHECK SL/TP HITS ──
@@ -4224,6 +4227,33 @@ function runStrategy() {
       `[${sess}]${kzTag} SELL ${grade}${nTag} — M5-Sweep→M1-Disp→BMS→OB→FVG→20-50% ✓ SL@sweep-high`, mid);
     // SL placed at M5 sweep candle high (new strategy spec)
     placeDemoTrade('DOWN', ss.slRef || ss.ob, ss.quality);
+
+  // ── HFT MOMENTUM-FOLLOW FALLBACK ──
+  // When the full SMC chain hasn't fired, take fast trades in the direction
+  // the market is currently moving (short-term M1 momentum), so the bot
+  // stays active in trending/expansion regimes instead of waiting for rare
+  // reversal setups. Gated by regime (no DEAD/RANGE — those are choppy and
+  // momentum-follow is more likely to whipsaw) and a short cooldown.
+  } else if (now - lastMomentumMs > MOMENTUM_COOLDOWN_MS &&
+             (regime === 'TREND' || regime === 'EXPANSION')) {
+    const m1 = candles[60];
+    const lastClosed = m1[m1.length - 2];
+    const prev3 = m1.slice(-5, -2); // 3 bars before the last closed bar
+    if (lastClosed && prev3.length === 3) {
+      const refClose = prev3[0].close;
+      const momo = lastClosed.close - refClose; // net direction over ~4 bars
+      const atr = calculateVolatility(60);
+      const threshold = (atr || 1) * 0.4; // require meaningful directional move
+      if (Math.abs(momo) >= threshold) {
+        lastMomentumMs = now;
+        lastSigMs = now;
+        const dir = momo > 0 ? 'UP' : 'DOWN';
+        const sess = strategy.activeSession() || 'SESSION';
+        addSignal(dir === 'UP' ? 'buy' : 'sell',
+          `[${sess}] MOMENTUM ${dir === 'UP' ? 'BUY' : 'SELL'} ★ — M1 drift ${momo.toFixed(2)}pt ≥ ${threshold.toFixed(2)} (${regime})`, mid);
+        placeDemoTrade(dir, null, 1); // quality 1 → smaller size, tight SL/TP from CFG
+      }
+    }
   }
 }
 
